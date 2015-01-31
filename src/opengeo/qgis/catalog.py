@@ -13,6 +13,7 @@ import os
 from qgis.core import *
 from PyQt4.QtXml import *
 from PyQt4.QtCore import *
+from PyQt4.QtGui import *
 from opengeo.qgis import layers, exporter, utils
 from geoserver.catalog import ConflictingDataError, UploadError, FailedRequestError
 from geoserver.catalog import Catalog as GSCatalog
@@ -22,6 +23,9 @@ from opengeo.qgis import uri as uri_utils
 from opengeo.qgis.utils import tempFilename
 from gsimporter.client import Client
 from opengeo.geoserver.pki import PKICatalog, PKIClient
+from opengeo.gui.gsnameutils import xmlNameFixUp, xmlNameRegex, xmlNameRegexMsg
+from opengeo.gui.dialogs.gsnamedialog import GSNameDialog
+from opengeo.gui.dialogs.userpasswd import UserPasswdDialog
 
 try:
     from processing.modeler.ModelerAlgorithm import ModelerAlgorithm
@@ -185,8 +189,10 @@ class OGCatalog(object):
                                      schema = uri.schema(),
                                      port = uri.port(),
                                      user = uri.username(),
-                                     passwd = uri.password())
-        self.catalog.publish_featuretype(uri.table(), store, layer.crs().authid())
+                                     passwd = uri.password(),
+                                     layername=layer.name())
+        if store is not None:
+            self.catalog.publish_featuretype(uri.table(), store, layer.crs().authid())
 
 
     def _uploadRest(self, layer, workspace, overwrite, name):
@@ -482,28 +488,89 @@ class OGCatalog(object):
             raise Exception("Cannot add layer. Unsupported layer type.")
 
 def createPGFeatureStore(catalog, name, workspace=None, overwrite=False,
-    host="localhost", port = 5432 , database="db", schema="public", user="postgres", passwd=""):
+    host="localhost", port=5432, database="db", schema="public", user="postgres", passwd="", layername=None):
+    # GeoServer's PG connector apparently requires a username.
+    # Username is not required to be defined for a QGIS PG layer (e.g. user can
+    # rely upon PG's default). Username and/or password might be saved in QGIS,
+    # though the user has to choose the option to have them saved
+    if not user or (user and not passwd):
+        updlg = UserPasswdDialog(user=user, passwd=passwd)
+
+        QApplication.setOverrideCursor(QCursor(Qt.ArrowCursor))
+        updlg.exec_()
+        QApplication.restoreOverrideCursor()
+
+        if updlg.user:
+            user = updlg.user
+            passwd = updlg.passwd
+        else:
+            return None
+
+    if overwrite and layername is not None:
+        lyrstore = None
+        try:
+            lyrrsc = catalog.get_resource(layername)
+            if lyrrsc is not None:
+                lyrstore = lyrrsc.store
+        except Exception, e:
+            raise e
+
+        msg = 'Cannot overwrite store for layer named ' + layername
+        if workspace is not None:
+            msg += " in '" + str(workspace) + "'"
+        if lyrstore is None:
+            msg += ': store for layer not found'
+            raise ConflictingDataError(msg)
+        else:
+            # if existing store is the same we are trying to add, just return it
+            params = lyrstore.connection_parameters
+            if (str(params['port']) == str(port)
+                    and params['database'] == database
+                    and params['host'] == host
+                    and params['user'] == user):
+                return lyrstore
+            else:
+                msg += ': connection info is different'
+                raise ConflictingDataError(msg)
+
+    stores = []
+    storenames = []
+    try:
+        stores = catalog.get_stores(workspace)
+        if stores:
+            storenames = [s.name for s in stores]
+    except Exception, e:
+        raise e
+
+    ndlg = GSNameDialog(
+        boxtitle='GeoServer data store name',
+        name=xmlNameFixUp(name),
+        namemsg='Sample is generated from PostgreSQL connection name.',
+        nameregex=xmlNameRegex(),
+        nameregexmsg=xmlNameRegexMsg(),
+        names=storenames,
+        unique=True,
+    )
+
+    QApplication.setOverrideCursor(QCursor(Qt.ArrowCursor))
+    ndlg.exec_()
+    QApplication.restoreOverrideCursor()
+
+    name = ndlg.definedName()
+    if not name:
+        return None
+
     try:
         store = catalog.get_store(name, workspace)
     except FailedRequestError:
         store = None
-    if store is not None:
-        if overwrite:
-            #if the existing store is the same we are trying to add, we do nothing
-            params = store.connection_parameters
-            if (str(params['port']) == str(port) and params['database'] == database and params['host'] == host
-                    and params['user'] == user):
-                return store
-        else:
-            msg = "There is already a store named " + name
-            if workspace:
-                msg += " in " + str(workspace)
-            raise ConflictingDataError(msg)
 
     if store is None:
         store = catalog.create_datastore(name, workspace)
+
     store.connection_parameters.update(
         host=host, port=str(port), database=database, user=user, schema=schema,
-        passwd=passwd, dbtype="postgis")
+        passwd=passwd, dbtype='postgis')
+
     catalog.save(store)
     return store
